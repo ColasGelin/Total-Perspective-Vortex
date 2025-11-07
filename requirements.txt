@@ -1,0 +1,4 @@
+pywavelets
+mne
+scikit-learn
+numpy

@@ -3,8 +3,9 @@ import numpy as np
 from sklearn.pipeline import Pipeline
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.model_selection import cross_val_score, train_test_split
-from mne.decoding import CSP
 import matplotlib.pyplot as plt
+from pca import PCA
+from wavelet_transformer import WaveletTransformer
 
 print("=" * 60)
 print("EEG MOTOR IMAGERY CLASSIFICATION PIPELINE")
@@ -19,6 +20,15 @@ print(f"✓ Loaded {len(files)} runs")
 
 # STEP 2: PREPROCESSING
 print("\n🔧 Preprocessing...")
+
+
+files = mne.datasets.eegbci.load_data(1, [3, 7, 11])
+raw = mne.concatenate_raws([mne.io.read_raw_edf(f, preload=True) for f in files])
+
+# Pick motor imagery relevant channels
+motor_channels = ['C3..', 'Cz..', 'C4..', 'Fc3.', 'Fcz.', 'Fc4.', 'Cp3.', 'Cpz.', 'Cp4.']
+raw.pick(motor_channels)
+
 # Bandpass filter for motor imagery (mu and beta bands)
 raw.filter(l_freq=8.0, h_freq=30.0, method='fir')
 print("✓ Bandpass filter applied: 8-30 Hz")
@@ -63,13 +73,20 @@ print("\n🔨 Building sklearn pipeline...")
 print("   Stage 1: CSP (Common Spatial Patterns) - dimensionality reduction")
 print("   Stage 2: LDA (Linear Discriminant Analysis) - classification")
 
+# STEP 4: CREATE SKLEARN PIPELINE
+print("\n🔨 Building sklearn pipeline...")
+print("   Stage 1: Wavelet Transform (feature extraction with pywt)")
+print("   Stage 2: PCA (dimensionality reduction)")
+print("   Stage 3: LDA (Linear Discriminant Analysis) - classification")
+
 # Create the pipeline
 pipeline = Pipeline([
-    ('CSP', CSP(n_components=4, reg=None, log=True, norm_trace=False)),
-    ('LDA', LinearDiscriminantAnalysis())
+    ('wavelet', WaveletTransformer()),
+    ('pca', PCA(n_components=0.95)),  
+    ('lda', LinearDiscriminantAnalysis())
 ])
 
-print("✓ Pipeline created!")
+print("✓ Pipeline created with Wavelet + PCA + LDA")
 print("\nPipeline structure:")
 print(pipeline)
 
