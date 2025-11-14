@@ -13,8 +13,8 @@ class PCA(BaseEstimator, TransformerMixin):
         
     def fit(self, X, y=None):
         # Flatten
-        n_epochs, n_channels, n_times = X.shape
-        X_flat = X.reshape(n_epochs, n_channels * n_times)
+        n_epochs, n_features = X.shape
+        X_flat = X.reshape(n_epochs, n_features)
         
         # Center the data (substract mean)
         self.mean_ = np.mean(X_flat, axis=0)
@@ -45,15 +45,14 @@ class PCA(BaseEstimator, TransformerMixin):
         if self.components_ is None or self.mean_ is None:
             raise RuntimeError("You must fit PCAFeatureExtractor before executing the transform function")
 
-        n_epochs, n_channels, n_times = X.shape
-        X_flat = X.reshape(n_epochs, n_channels * n_times)
-        
+        n_epochs, n_features = X.shape
+        X_flat = X.reshape(n_epochs, n_features)
+
         # Center the data
         X_centered = X_flat - self.mean_
         
         # Project onto principal components
         X_projected = np.dot(X_centered, self.components_)
-        
         return X_projected
     
     def compute_explained_variance_ratio(self):

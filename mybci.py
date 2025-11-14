@@ -3,121 +3,160 @@ import numpy as np
 from sklearn.pipeline import Pipeline
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 from pca import PCA
 from wavelet_transformer import WaveletTransformer
+import argparse
+mne.set_log_level('WARNING')
+
+# Define 6 experiments
+EXPERIMENTS = {
+    0: {'runs': [3, 7, 11], 'events': ['T1', 'T2'], 'desc': 'Real left vs right fist'},
+    1: {'runs': [5, 9, 13], 'events': ['T1', 'T2'], 'desc': 'Real both fists vs feet'},
+    2: {'runs': [4, 8, 12], 'events': ['T1', 'T2'], 'desc': 'Imagined left vs right fist'},
+    3: {'runs': [6, 10, 14], 'events': ['T1', 'T2'], 'desc': 'Imagined both fists vs feet'},
+    4: {'runs': [4, 8, 12], 'events': ['T0', 'T1'], 'desc': 'Rest vs left fist'},
+    5: {'runs': [5, 9, 13], 'events': ['T0', 'T2'], 'desc': 'Rest vs both feet'}
+}
+
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description='EEG Motor Imagery Classification Pipeline')
+parser.add_argument('--n_components', type=float, default=0.95, 
+                    help='PCA n_components (float 0-1 for variance ratio, int for fixed count). Default: 0.99')
+parser.add_argument('--freq_min', type=int, default=8, 
+                    help='Minimum wavelet frequency (Hz). Default: 8')
+parser.add_argument('--freq_max', type=int, default=30, 
+                    help='Maximum wavelet frequency (Hz). Default: 30')
+parser.add_argument('--freq_step', type=int, default=2, 
+                    help='Wavelet frequency step (Hz). Default: 2')
+parser.add_argument('--subjects', type=int, default=50,
+                    help='Subject IDs to load. Default: 1 2 3 4 5')
+args = parser.parse_args()
 
 print("=" * 60)
 print("EEG MOTOR IMAGERY CLASSIFICATION PIPELINE")
-print("CSP (Common Spatial Patterns) + LDA (Linear Discriminant Analysis)")
+print("Wavelet + PCA + LDA")
 print("=" * 60)
+print(f"\n⚙️  Configuration:")
+print(f"   PCA n_components: {args.n_components}")
+print(f"   Wavelet frequencies: {args.freq_min}-{args.freq_max} Hz (step {args.freq_step})")
+print(f"   Subjects: {args.subjects}")
 
-# STEP 1: LOAD AND PREPARE DATA
+# STEP 1: LOAD AND PREPARE DATA FROM MULTIPLE SUBJECTS
+print("\n📥 Loading EEG motor imagery dataset...")
+subjects = np.arange(1, args.subjects + 1)
+all_X = []
+all_y = []
 
-files = mne.datasets.eegbci.load_data(1, [3, 7, 11])  # Subject 1, multiple runs
-raw = mne.concatenate_raws([mne.io.read_raw_edf(f, preload=True) for f in files])
-print(f"✓ Loaded {len(files)} runs")
+subjects = np.arange(1, args.subjects + 1)
+all_subject_scores = []
+all_experiment_accuracies = []
 
-# STEP 2: PREPROCESSING
-print("\n🔧 Preprocessing...")
+for exp_num in range(6):
+    exp_config = EXPERIMENTS[exp_num]
+    print(f"\n{'='*60}")
+    print(f"🧪 EXPERIMENT {exp_num}: {exp_config['desc']}")
+    print(f"   Runs: {exp_config['runs']}, Events: {exp_config['events']}")
+    print('='*60)
+    
+    experiment_subject_accuracies = []
+    for subject in subjects:
+        print(f"\n{'='*60}")
+        print(f"📂 Processing Subject {subject}")
+        print('='*60)
+        
+        # Load THIS subject only
+        try:
+            files = mne.datasets.eegbci.load_data(subject, exp_config['runs'])
+            raw = mne.concatenate_raws([mne.io.read_raw_edf(f, preload=True) for f in files])
+        except Exception as e:
+            print(f"⚠️  Skipping subject {subject}: {e}")
+            continue
+        
+        # Preprocessing (same as before)
+        motor_channels = ['C3..', 'Cz..', 'C4..', 'Fc3.', 'Fcz.', 'Fc4.', 'Cp3.', 'Cpz.', 'Cp4.']
+        raw.pick(motor_channels)
+        raw.set_eeg_reference('average', projection=True)
+        raw.filter(l_freq=8.0, h_freq=30.0, method='fir')
+        raw.notch_filter(freqs=60)  # ADD THIS
+        
+        events, event_dict = mne.events_from_annotations(raw)
+        event_id = {event: event_dict[event] for event in exp_config['events'] if event in event_dict}
+        
+        if len(event_id) != 2:
+            print(f"⚠️  Skipping subject {subject}: Not enough events found")
+            continue
+        
+        epochs = mne.Epochs(raw, events, event_id=event_id, 
+                            tmin=0.0, tmax=3.0, baseline=None, 
+                            preload=True, reject=None)
+        epochs.drop_bad()
+        
+        epochs = epochs[exp_config['events']]
+        
+        if len(epochs) < 10:  # Sanity check
+            print(f"⚠️  Skipping subject {subject}: Too few epochs ({len(epochs)})")
+            continue
+        
+        X = epochs.get_data()
+        y = epochs.events[:, 2]
+        
+        print(f"✓ Subject {subject}: {len(epochs)} epochs")
+        
+        # Split THIS subject's data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        
+        # Build pipeline for THIS subject
+        wavelet_freqs = np.arange(args.freq_min, args.freq_max + 1, args.freq_step)
+        
+        pipeline = Pipeline([
+            ('wavelet', WaveletTransformer(frequencies=wavelet_freqs)),
+            ('scaler', StandardScaler()),
+            ('pca', PCA()),
+            ('lda', LinearDiscriminantAnalysis(solver="lsqr"))
+        ])
+        
+        # GridSearchCV for THIS subject
+        from sklearn.model_selection import GridSearchCV, ShuffleSplit
+        
+        param_grid = {
+            'pca__n_components': [2, 4, 6, 8, 10, 15, 20],
+            'lda__shrinkage': ['auto', 0.1, 0.3]
+        }
+        
+        cv = ShuffleSplit(n_splits=10, test_size=0.2, random_state=42)
+        grid = GridSearchCV(pipeline, param_grid, cv=cv, 
+                        scoring='accuracy', n_jobs=-1, verbose=0)
+        
+        print(f"🔍 Training and optimizing for subject {subject}...")
+        grid.fit(X_train, y_train)
 
+        # Test on held-out data with playback simulation
+        predictions = []
+        for i in range(len(X_test)):
+            single_epoch = X_test[i:i+1]  # One epoch at a time
+            prediction = grid.predict(single_epoch)
+            predictions.append(prediction[0])  # Store prediction
 
-files = mne.datasets.eegbci.load_data(1, [3, 7, 11])
-raw = mne.concatenate_raws([mne.io.read_raw_edf(f, preload=True) for f in files])
+        # Calculate accuracy for this subject
+        test_score = np.mean(np.array(predictions) == y_test)
+        all_subject_scores.append(test_score)
 
-# Pick motor imagery relevant channels
-motor_channels = ['C3..', 'Cz..', 'C4..', 'Fc3.', 'Fcz.', 'Fc4.', 'Cp3.', 'Cpz.', 'Cp4.']
-raw.pick(motor_channels)
+        print(f"✅ Subject {subject} - Best params: {grid.best_params_}")
+        print(f"✅ Subject {subject} - Test accuracy: {test_score*100:.2f}%")
 
-# Bandpass filter for motor imagery (mu and beta bands)
-raw.filter(l_freq=8.0, h_freq=30.0, method='fir')
-print("✓ Bandpass filter applied: 8-30 Hz")
+# Final results
+print("\n" + "="*60)
+print("📊 FINAL RESULTS")
+print("="*60)
+print(f"Mean accuracy across {len(subjects)} subjects: {np.mean(all_subject_scores)*100:.2f}%")
+print(f"Std: +/- {np.std(all_subject_scores)*100:.2f}%")
+print(f"Individual scores: {[f'{s*100:.1f}%' for s in all_subject_scores]}")
 
-# Extract events
-events, event_dict = mne.events_from_annotations(raw)
-print(f"\n📊 Events found: {event_dict}")
-
-# We want to classify T1 (left fist) vs T2 (right fist)
-# Remove T0 (rest) events
-event_id = {'T1': event_dict['T1'], 'T2': event_dict['T2']}
-
-# We want to classify T0 (rest) vs T1 (left fist) vs T2 (right fist)
-# event_id = {'T0': event_dict['T0'], 'T1': event_dict['T1'], 'T2': event_dict['T2']}
-print(f"✓ Using events: {event_id}")
-
-# STEP 3: CREATE EPOCHS (DATA CHUNKS)
-print("\n✂️ Creating epochs (data chunks around events)...")
-tmin, tmax = 0.0, 4.0  # 0-4 seconds after event (motor imagery period)
-epochs = mne.Epochs(
-    raw, 
-    events, 
-    event_id=event_id,
-    tmin=tmin, 
-    tmax=tmax,
-    baseline=None,  # No baseline correction for CSP
-    preload=True,
-    reject=None  # You can add artifact rejection here if needed
-)
-print(f"✓ Created {len(epochs)} epochs")
-print(f"  - T1 (left fist): {len(epochs['T1'])} epochs")
-print(f"  - T2 (right fist): {len(epochs['T2'])} epochs")
-
-# Get data in sklearn format
-X = epochs.get_data()  # Shape: (n_epochs, n_channels, n_times)
-y = epochs.events[:, 2]  # Labels
-print(f"\n📐 Data shape: {X.shape}")
-print(f"   (n_epochs={X.shape[0]}, n_channels={X.shape[1]}, n_times={X.shape[2]})")
-
-# STEP 4: CREATE SKLEARN PIPELINE
-print("\n🔨 Building sklearn pipeline...")
-print("   Stage 1: CSP (Common Spatial Patterns) - dimensionality reduction")
-print("   Stage 2: LDA (Linear Discriminant Analysis) - classification")
-
-# STEP 4: CREATE SKLEARN PIPELINE
-print("\n🔨 Building sklearn pipeline...")
-print("   Stage 1: Wavelet Transform (feature extraction with pywt)")
-print("   Stage 2: PCA (dimensionality reduction)")
-print("   Stage 3: LDA (Linear Discriminant Analysis) - classification")
-
-# Create the pipeline
-pipeline = Pipeline([
-    ('wavelet', WaveletTransformer()),
-    ('pca', PCA(n_components=0.95)),  
-    ('lda', LinearDiscriminantAnalysis())
-])
-
-print("✓ Pipeline created with Wavelet + PCA + LDA")
-print("\nPipeline structure:")
-print(pipeline)
-
-# STEP 5: TRAIN/TEST SPLIT
-print("\n📊 Splitting data into train/test sets (80/20)...")
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=y
-)
-print(f"✓ Training set: {X_train.shape[0]} epochs")
-print(f"✓ Test set: {X_test.shape[0]} epochs")
-
-# STEP 6: TRAIN THE PIPELINE
-print("\n🎓 Training the pipeline...")
-pipeline.fit(X_train, y_train)
-print("✓ Training complete!")
-
-# STEP 7: EVALUATE
-print("\n📈 EVALUATION")
-print("=" * 60)
-
-# Test accuracy
-test_score = pipeline.score(X_test, y_test)
-print(f"Test Accuracy: {test_score * 100:.2f}%")
-
-# Cross-validation
-cv_scores = cross_val_score(pipeline, X_train, y_train, cv=5)
-print(f"\nCross-Validation (5-fold):")
-print(f"  Mean: {cv_scores.mean() * 100:.2f}% (+/- {cv_scores.std() * 100:.2f}%)")
-
-# STEP 8: SAVE THE MODEL
-import joblib
-joblib.dump(pipeline, 'eeg_model.pkl')
-print("\n✅ Model saved to 'eeg_model.pkl'")
-print("Ready for real-time prediction!")
+if np.mean(all_subject_scores) >= 0.60:
+    print("\n✅ REQUIREMENT MET: Mean accuracy ≥ 60%")
+else:
+    print(f"\n❌ REQUIREMENT NOT MET: {np.mean(all_subject_scores)*100:.2f}% < 60%")
