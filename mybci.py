@@ -2,15 +2,25 @@ import mne
 import numpy as np
 from sklearn.pipeline import Pipeline
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.model_selection import cross_val_score, train_test_split, GridSearchCV, ShuffleSplit
 from sklearn.preprocessing import StandardScaler
-import matplotlib.pyplot as plt
+import argparse
+import pickle
 from pca import PCA
 from wavelet_transformer import WaveletTransformer
-import argparse
+
 mne.set_log_level('WARNING')
 
-# Define 6 experiments
+# ---------------------------------------------------------
+#  CONFIG
+# ---------------------------------------------------------
+
+MOTOR_CHANNELS = [
+    'C3..','Cz..','C4..','Fc3.','Fcz.','Fc4.','Cp3.','Cpz.','Cp4.'
+]
+
+WAVELET_FREQS = np.arange(8, 31, 2)
+
 EXPERIMENTS = {
     0: {'runs': [3, 7, 11], 'events': ['T1', 'T2'], 'desc': 'Real left vs right fist'},
     1: {'runs': [5, 9, 13], 'events': ['T1', 'T2'], 'desc': 'Real both fists vs feet'},
@@ -20,143 +30,212 @@ EXPERIMENTS = {
     5: {'runs': [5, 9, 13], 'events': ['T0', 'T2'], 'desc': 'Rest vs both feet'}
 }
 
-# Parse command-line arguments
+# ---------------------------------------------------------
+#  COMMON FUNCTIONS TO REMOVE REDUNDANCY
+# ---------------------------------------------------------
+
+def load_raw(subject, runs):
+    """Load EEG data for a subject and given list of runs."""
+    files = mne.datasets.eegbci.load_data(subject, runs)
+    return mne.concatenate_raws([mne.io.read_raw_edf(f, preload=True) for f in files])
+
+
+def preprocess_raw(raw):
+    """Common preprocessing pipeline for all modes."""
+    raw.pick(MOTOR_CHANNELS)
+    raw.set_eeg_reference('average', projection=True)
+    raw.filter(l_freq=8.0, h_freq=30.0, method='fir')
+    raw.notch_filter(freqs=60)
+    return raw
+
+
+def epoch_data(raw, event_id, tmin=0.0, tmax=3.0):
+    """Create epochs from raw data."""
+    events, raw_event_dict = mne.events_from_annotations(raw)
+    epochs = mne.Epochs(
+        raw, events, event_id=event_id,
+        tmin=tmin, tmax=tmax,
+        baseline=None, preload=True, reject=None
+    )
+    epochs.drop_bad()
+    return epochs
+
+
+def build_pipeline():
+    """Build the feature-extraction and classification pipeline."""
+    return Pipeline([
+        ('wavelet', WaveletTransformer(frequencies=WAVELET_FREQS)),
+        ('scaler', StandardScaler()),
+        ('pca', PCA()),
+        ('lda', LinearDiscriminantAnalysis(solver="lsqr"))
+    ])
+
+
+# ---------------------------------------------------------
+#  MAIN LOGIC (TRAIN / PREDICT / EVAL)
+# ---------------------------------------------------------
+
 parser = argparse.ArgumentParser(description='EEG Motor Imagery Classification Pipeline')
-parser.add_argument('--n_components', type=float, default=0.95, 
-                    help='PCA n_components (float 0-1 for variance ratio, int for fixed count). Default: 0.99')
-parser.add_argument('--freq_min', type=int, default=8, 
-                    help='Minimum wavelet frequency (Hz). Default: 8')
-parser.add_argument('--freq_max', type=int, default=30, 
-                    help='Maximum wavelet frequency (Hz). Default: 30')
-parser.add_argument('--freq_step', type=int, default=2, 
-                    help='Wavelet frequency step (Hz). Default: 2')
-parser.add_argument('--subjects', type=int, default=50,
-                    help='Subject IDs to load. Default: 1 2 3 4 5')
+parser.add_argument('subject', type=int, nargs='?', default=109)
+parser.add_argument('run', type=int, nargs='?', default=None)
+parser.add_argument('mode', type=str, nargs='?', default='eval',
+                    choices=['train', 'predict', 'eval'])
 args = parser.parse_args()
 
-print("=" * 60)
-print("EEG MOTOR IMAGERY CLASSIFICATION PIPELINE")
-print("Wavelet + PCA + LDA")
-print("=" * 60)
-print(f"\n⚙️  Configuration:")
-print(f"   PCA n_components: {args.n_components}")
-print(f"   Wavelet frequencies: {args.freq_min}-{args.freq_max} Hz (step {args.freq_step})")
-print(f"   Subjects: {args.subjects}")
+# ---------------------------------------------------------
+#  TRAIN MODE
+# ---------------------------------------------------------
 
-# STEP 1: LOAD AND PREPARE DATA FROM MULTIPLE SUBJECTS
-print("\n📥 Loading EEG motor imagery dataset...")
-subjects = np.arange(1, args.subjects + 1)
-all_X = []
-all_y = []
+if args.mode == 'train':
+    if args.subject is None or args.run is None:
+        print("❌ train mode requires <subject> <run>")
+        exit(1)
 
-subjects = np.arange(1, args.subjects + 1)
-all_subject_scores = []
-all_experiment_accuracies = []
+    # Load + preprocess
+    raw = preprocess_raw(load_raw(args.subject, [args.run]))
 
-for exp_num in range(6):
-    exp_config = EXPERIMENTS[exp_num]
-    print(f"\n{'='*60}")
-    print(f"🧪 EXPERIMENT {exp_num}: {exp_config['desc']}")
-    print(f"   Runs: {exp_config['runs']}, Events: {exp_config['events']}")
-    print('='*60)
-    
-    experiment_subject_accuracies = []
-    for subject in subjects:
-        print(f"\n{'='*60}")
-        print(f"📂 Processing Subject {subject}")
-        print('='*60)
-        
-        # Load THIS subject only
-        try:
-            files = mne.datasets.eegbci.load_data(subject, exp_config['runs'])
-            raw = mne.concatenate_raws([mne.io.read_raw_edf(f, preload=True) for f in files])
-        except Exception as e:
-            print(f"⚠️  Skipping subject {subject}: {e}")
-            continue
-        
-        # Preprocessing (same as before)
-        motor_channels = ['C3..', 'Cz..', 'C4..', 'Fc3.', 'Fcz.', 'Fc4.', 'Cp3.', 'Cpz.', 'Cp4.']
-        raw.pick(motor_channels)
-        raw.set_eeg_reference('average', projection=True)
-        raw.filter(l_freq=8.0, h_freq=30.0, method='fir')
-        raw.notch_filter(freqs=60)  # ADD THIS
-        
-        events, event_dict = mne.events_from_annotations(raw)
-        event_id = {event: event_dict[event] for event in exp_config['events'] if event in event_dict}
-        
-        if len(event_id) != 2:
-            print(f"⚠️  Skipping subject {subject}: Not enough events found")
-            continue
-        
-        epochs = mne.Epochs(raw, events, event_id=event_id, 
-                            tmin=0.0, tmax=3.0, baseline=None, 
-                            preload=True, reject=None)
-        epochs.drop_bad()
-        
-        epochs = epochs[exp_config['events']]
-        
-        if len(epochs) < 10:  # Sanity check
-            print(f"⚠️  Skipping subject {subject}: Too few epochs ({len(epochs)})")
-            continue
-        
-        X = epochs.get_data()
-        y = epochs.events[:, 2]
-        
-        print(f"✓ Subject {subject}: {len(epochs)} epochs")
-        
-        # Split THIS subject's data
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
-        )
-        
-        # Build pipeline for THIS subject
-        wavelet_freqs = np.arange(args.freq_min, args.freq_max + 1, args.freq_step)
-        
-        pipeline = Pipeline([
-            ('wavelet', WaveletTransformer(frequencies=wavelet_freqs)),
-            ('scaler', StandardScaler()),
-            ('pca', PCA()),
-            ('lda', LinearDiscriminantAnalysis(solver="lsqr"))
-        ])
-        
-        # GridSearchCV for THIS subject
-        from sklearn.model_selection import GridSearchCV, ShuffleSplit
-        
-        param_grid = {
-            'pca__n_components': [2, 4, 6, 8, 10, 15, 20],
-            'lda__shrinkage': ['auto', 0.1, 0.3]
-        }
-        
-        cv = ShuffleSplit(n_splits=10, test_size=0.2, random_state=42)
-        grid = GridSearchCV(pipeline, param_grid, cv=cv, 
-                        scoring='accuracy', n_jobs=-1, verbose=0)
-        
-        print(f"🔍 Training and optimizing for subject {subject}...")
-        grid.fit(X_train, y_train)
+    # Epoch
+    events, event_dict = mne.events_from_annotations(raw)
+    epochs = epoch_data(raw, event_dict)
+    X = epochs.get_data()
+    y = epochs.events[:, 2]
 
-        # Test on held-out data with playback simulation
-        predictions = []
-        for i in range(len(X_test)):
-            single_epoch = X_test[i:i+1]  # One epoch at a time
-            prediction = grid.predict(single_epoch)
-            predictions.append(prediction[0])  # Store prediction
+    # Train CV
+    pipeline = build_pipeline()
+    cv = ShuffleSplit(n_splits=10, test_size=0.1, random_state=42)
+    scores = cross_val_score(pipeline, X, y, cv=cv, scoring='accuracy')
 
-        # Calculate accuracy for this subject
-        test_score = np.mean(np.array(predictions) == y_test)
-        all_subject_scores.append(test_score)
+    print(scores)
+    print(f"Cross-val mean: {np.mean(scores):.4f}")
 
-        print(f"✅ Subject {subject} - Best params: {grid.best_params_}")
-        print(f"✅ Subject {subject} - Test accuracy: {test_score*100:.2f}%")
+    # Fit full
+    pipeline.fit(X, y)
 
-# Final results
-print("\n" + "="*60)
-print("📊 FINAL RESULTS")
-print("="*60)
-print(f"Mean accuracy across {len(subjects)} subjects: {np.mean(all_subject_scores)*100:.2f}%")
-print(f"Std: +/- {np.std(all_subject_scores)*100:.2f}%")
-print(f"Individual scores: {[f'{s*100:.1f}%' for s in all_subject_scores]}")
+    # Save
+    fname = f"model_s{args.subject}_r{args.run}.pkl"
+    with open(fname, 'wb') as f:
+        pickle.dump({
+            'pipeline': pipeline,
+            'subject': args.subject,
+            'run': args.run,
+            'event_dict': event_dict,
+            'cv_scores': scores,
+            'mean_cv_score': np.mean(scores)
+        }, f)
 
-if np.mean(all_subject_scores) >= 0.60:
-    print("\n✅ REQUIREMENT MET: Mean accuracy ≥ 60%")
+    print(f"✔ Model saved to {fname}")
+
+
+# ---------------------------------------------------------
+#  PREDICT MODE
+# ---------------------------------------------------------
+
+elif args.mode == 'predict':
+    if args.subject is None or args.run is None:
+        print("❌ predict mode requires <subject> <run>")
+        exit(1)
+
+    # Load trained model
+    fname = f"model_s{args.subject}_r{args.run}.pkl"
+    with open(fname, 'rb') as f:
+        data = pickle.load(f)
+
+    pipeline = data['pipeline']
+    event_id = data['event_dict']
+
+    # Reload + preprocess
+    raw = preprocess_raw(load_raw(args.subject, [args.run]))
+
+    # Epoch
+    epochs = epoch_data(raw, event_id)
+    X = epochs.get_data()
+    y_true = epochs.events[:, 2]
+
+    # Predict
+    y_pred = pipeline.predict(X)
+
+    # Report
+    print("\nepoch: pred | true | match")
+    correct = 0
+    for i, (p, t) in enumerate(zip(y_pred, y_true)):
+        print(f"{i:02d}: [{p}] [{t}] {p==t}")
+        correct += (p == t)
+
+    print(f"\nAccuracy: {correct / len(y_true):.4f}")
+
+
+# ---------------------------------------------------------
+#  EVAL MODE (MULTI-SUBJECT)
+# ---------------------------------------------------------
+
 else:
-    print(f"\n❌ REQUIREMENT NOT MET: {np.mean(all_subject_scores)*100:.2f}% < 60%")
+    print("=" * 60)
+    print("FULL EVAL MODE")
+    print("=" * 60)
+
+    subjects = np.arange(1, args.subject + 1)
+    all_scores = []
+
+    for exp_index, exp_cfg in EXPERIMENTS.items():
+        print("\n" + "="*60)
+        print(f"EXPERIMENT {exp_index}: {exp_cfg['desc']}")
+        print("="*60)
+
+        for subject in subjects:
+            print(f"\n→ Subject {subject}")
+
+            # Load
+            try:
+                raw = load_raw(subject, exp_cfg['runs'])
+            except:
+                print("Skipping (load error)")
+                continue
+
+            raw = preprocess_raw(raw)
+
+            # Epoch
+            events, event_dict = mne.events_from_annotations(raw)
+            event_id = {e: event_dict[e] for e in exp_cfg['events'] if e in event_dict}
+            if len(event_id) != 2:
+                print("Skipping (missing events)")
+                continue
+
+            epochs = epoch_data(raw, event_id)
+            epochs = epochs[exp_cfg['events']]
+
+            if len(epochs) < 10:
+                print("Skipping (too few epochs)")
+                continue
+
+            X = epochs.get_data()
+            y = epochs.events[:, 2]
+
+            # Train/test split
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=42, stratify=y
+            )
+
+            # Build pipeline
+            pipeline = build_pipeline()
+
+            param_grid = {
+                'pca__n_components': [2,4,6,8,10,15,20],
+                'lda__shrinkage': ['auto', 0.1, 0.3]
+            }
+
+            cv = ShuffleSplit(n_splits=10, test_size=0.2, random_state=42)
+            grid = GridSearchCV(pipeline, param_grid, cv=cv,
+                                scoring='accuracy', n_jobs=-1, verbose=0)
+
+            grid.fit(X_train, y_train)
+
+            preds = [grid.predict(X_test[i:i+1])[0] for i in range(len(X_test))]
+            acc = np.mean(preds == y_test)
+            print(f"✔ Accuracy: {acc*100:.2f}%")
+            all_scores.append(acc)
+
+    print("\n" + "="*60)
+    print("FINAL SUMMARY")
+    print("="*60)
+    print(f"Mean: {np.mean(all_scores)*100:.2f}%")
+    print(f"Std: {np.std(all_scores)*100:.2f}%")
