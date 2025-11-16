@@ -1,3 +1,4 @@
+from pathlib import Path
 import mne
 import numpy as np
 from sklearn.pipeline import Pipeline
@@ -8,12 +9,9 @@ import argparse
 import pickle
 from pca import PCA
 from wavelet_transformer import WaveletTransformer
+import matplotlib.pyplot as plt
 
 mne.set_log_level('WARNING')
-
-# ---------------------------------------------------------
-#  CONFIG
-# ---------------------------------------------------------
 
 MOTOR_CHANNELS = [
     'C3..','Cz..','C4..','Fc3.','Fcz.','Fc4.','Cp3.','Cpz.','Cp4.'
@@ -30,14 +28,25 @@ EXPERIMENTS = {
     5: {'runs': [5, 9, 13], 'events': ['T0', 'T2'], 'desc': 'Rest vs both feet'}
 }
 
-# ---------------------------------------------------------
-#  COMMON FUNCTIONS TO REMOVE REDUNDANCY
-# ---------------------------------------------------------
+DATA_BASE_PATH = Path("eeg-motor-movementimagery-dataset-1.0.0/files/")
 
 def load_raw(subject, runs):
-    """Load EEG data for a subject and given list of runs."""
-    files = mne.datasets.eegbci.load_data(subject, runs)
-    return mne.concatenate_raws([mne.io.read_raw_edf(f, preload=True) for f in files])
+    subject_dir = DATA_BASE_PATH / f"S{subject:03d}"
+    
+    if not subject_dir.exists():
+        raise FileNotFoundError(f"Subject directory not found: {subject_dir}")
+    
+    raw_list = []
+    for run in runs:
+        edf_file = subject_dir / f"S{subject:03d}R{run:02d}.edf"
+        
+        if not edf_file.exists():
+            raise FileNotFoundError(f"EDF file not found: {edf_file}")
+        
+        raw = mne.io.read_raw_edf(edf_file, preload=True)
+        raw_list.append(raw)
+    
+    return mne.concatenate_raws(raw_list)
 
 
 def preprocess_raw(raw):
@@ -70,23 +79,7 @@ def build_pipeline():
         ('lda', LinearDiscriminantAnalysis(solver="lsqr"))
     ])
 
-
-# ---------------------------------------------------------
-#  MAIN LOGIC (TRAIN / PREDICT / EVAL)
-# ---------------------------------------------------------
-
-parser = argparse.ArgumentParser(description='EEG Motor Imagery Classification Pipeline')
-parser.add_argument('subject', type=int, nargs='?', default=109)
-parser.add_argument('run', type=int, nargs='?', default=None)
-parser.add_argument('mode', type=str, nargs='?', default='eval',
-                    choices=['train', 'predict', 'eval'])
-args = parser.parse_args()
-
-# ---------------------------------------------------------
-#  TRAIN MODE
-# ---------------------------------------------------------
-
-if args.mode == 'train':
+def train_mode(args):
     if args.subject is None or args.run is None:
         print("❌ train mode requires <subject> <run>")
         exit(1)
@@ -95,7 +88,7 @@ if args.mode == 'train':
     raw = preprocess_raw(load_raw(args.subject, [args.run]))
 
     # Epoch
-    events, event_dict = mne.events_from_annotations(raw)
+    _, event_dict = mne.events_from_annotations(raw)
     epochs = epoch_data(raw, event_dict)
     X = epochs.get_data()
     y = epochs.events[:, 2]
@@ -124,13 +117,8 @@ if args.mode == 'train':
         }, f)
 
     print(f"✔ Model saved to {fname}")
-
-
-# ---------------------------------------------------------
-#  PREDICT MODE
-# ---------------------------------------------------------
-
-elif args.mode == 'predict':
+    
+def predict_mode(args):
     if args.subject is None or args.run is None:
         print("❌ predict mode requires <subject> <run>")
         exit(1)
@@ -162,24 +150,12 @@ elif args.mode == 'predict':
         correct += (p == t)
 
     print(f"\nAccuracy: {correct / len(y_true):.4f}")
-
-
-# ---------------------------------------------------------
-#  EVAL MODE (MULTI-SUBJECT)
-# ---------------------------------------------------------
-
-else:
-    print("=" * 60)
-    print("FULL EVAL MODE")
-    print("=" * 60)
-
+    
+def full_evaluation_mode(args):
     subjects = np.arange(1, args.subject + 1)
     all_scores = []
 
     for exp_index, exp_cfg in EXPERIMENTS.items():
-        print("\n" + "="*60)
-        print(f"EXPERIMENT {exp_index}: {exp_cfg['desc']}")
-        print("="*60)
 
         for subject in subjects:
             print(f"\n→ Subject {subject}")
@@ -233,6 +209,51 @@ else:
             acc = np.mean(preds == y_test)
             print(f"✔ Accuracy: {acc*100:.2f}%")
             all_scores.append(acc)
+            
+    return all_scores
+
+def visualize_mode(args):
+    # Load and filter
+    raw_original = load_raw(args.subject, [args.run])
+    raw_original.pick(MOTOR_CHANNELS)
+    raw_filtered = preprocess_raw(load_raw(args.subject, [args.run]))
+    
+    # Figure 1: Filtered EEG
+    raw_filtered.plot(duration=10, n_channels=len(MOTOR_CHANNELS),
+                      scalings='auto', title='Filtered EEG Data (8-30 Hz)')
+    
+    # Figure 2: PSD comparison
+    plt.figure(figsize=(14, 6))
+    psds_raw, freqs = raw_original.compute_psd(fmax=50).get_data(return_freqs=True)
+    psds_filtered, _ = raw_filtered.compute_psd(fmax=50).get_data(return_freqs=True)
+    
+    plt.semilogy(freqs, psds_raw.mean(axis=0), label='Raw', alpha=0.7, linewidth=2)
+    plt.semilogy(freqs, psds_filtered.mean(axis=0), label='Filtered (8-30 Hz)', alpha=0.7, linewidth=2)
+    plt.axvspan(8, 30, alpha=0.2, color='green', label='Kept frequencies (8-30 Hz)')
+    plt.xlabel('Frequency (Hz)', fontsize=12)
+    plt.ylabel('Power Spectral Density (V²/Hz)', fontsize=12)
+    plt.title('Power Spectral Density - Raw vs Filtered', fontsize=14)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xlim([0, 50])
+    plt.tight_layout()
+    plt.show()
+
+parser = argparse.ArgumentParser(description='EEG Motor Imagery Classification Pipeline')
+parser.add_argument('subject', type=int, nargs='?', default=109)
+parser.add_argument('run', type=int, nargs='?', default=None)
+parser.add_argument('mode', type=str, nargs='?', default='eval',
+                    choices=['train', 'predict', 'eval', 'visualize'])
+args = parser.parse_args()
+
+if args.mode == 'train':
+    train_mode(args)
+elif args.mode == 'predict':
+    predict_mode(args)
+elif args.mode == 'visualize':
+    visualize_mode(args)
+else:
+    all_scores = full_evaluation_mode(args)
 
     print("\n" + "="*60)
     print("FINAL SUMMARY")
