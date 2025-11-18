@@ -98,7 +98,7 @@ def train_mode(args):
 
     # Split train/test BEFORE any training
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+        X, y, test_size=0.3, random_state=42, stratify=y
     )
 
     # Train CV on TRAINING SET ONLY
@@ -136,25 +136,35 @@ def predict_mode(args):
 
     # Load trained model
     fname = f"model_s{args.subject}_r{args.run}.pkl"
-    with open(fname, 'rb') as f:
-        data = pickle.load(f)
+    try:
+        with open(fname, 'rb') as f:
+            data = pickle.load(f)
+    except FileNotFoundError:
+        print(f"❌ Model file not found: {fname}")
+        exit(1)
 
     pipeline = data['pipeline']
     X_test = data['X_test']
     y_test = data['y_test']
 
-    # Predict on the SAME test set that was held out during training
-    y_pred = pipeline.predict(X_test)
-
-    # Report
-    print("epoch: pred | true | match")
-    correct = 0
-    for i, (p, t) in enumerate(zip(y_pred, y_test)):
-        print(f"{i:02d}: [{p}] [{t}] {p==t}")
-        correct += (p == t)
-
-    accuracy = correct / len(y_test)
-    print(f"\nAccuracy: {accuracy:.4f}")
+    # Playback simulation: process one epoch at a time
+    print("epoch nb: [prediction] [truth] equal?")
+    predictions = []
+    processing_times = []
+    
+    for i in range(len(X_test)):
+        start = time.time()
+        pred = pipeline.predict(X_test[i:i+1])[0]
+        proc_time = time.time() - start
+        time.sleep(1.0)
+        processing_times.append(proc_time)
+        predictions.append(pred)
+        
+        print(f"epoch {i:02d}: [{pred}] [{y_test[i]}] {pred == y_test[i]}")
+    
+    accuracy = np.mean(np.array(predictions) == y_test)
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Max processing time: {max(processing_times)*1000:.1f}ms")
     
 def full_evaluation_mode(args):
     subjects = np.arange(1, args.subject + 1)
@@ -246,6 +256,8 @@ parser.add_argument('subject', type=int, nargs='?', default=109)
 parser.add_argument('run', type=int, nargs='?', default=None)
 parser.add_argument('mode', type=str, nargs='?', default='eval',
                     choices=['train', 'predict', 'eval', 'visualize'])
+parser.add_argument('-b', action='store_true', dest='b_flag', 
+                    help='Set b_flag variable to True')
 args = parser.parse_args()
 
 if args.mode == 'train':
