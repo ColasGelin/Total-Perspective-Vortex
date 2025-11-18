@@ -10,8 +10,11 @@ import pickle
 from pca import PCA
 from wavelet_transformer import WaveletTransformer
 import matplotlib.pyplot as plt
+import warnings
+import time
 
 mne.set_log_level('WARNING')
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*annotation.*expanding outside.*')
 
 MOTOR_CHANNELS = [
     'C3..','Cz..','C4..','Fc3.','Fcz.','Fc4.','Cp3.','Cpz.','Cp4.'
@@ -28,7 +31,7 @@ EXPERIMENTS = {
     5: {'runs': [5, 9, 13], 'events': ['T0', 'T2'], 'desc': 'Rest vs both feet'}
 }
 
-DATA_BASE_PATH = Path("eeg-motor-movementimagery-dataset-1.0.0/files/")
+DATA_BASE_PATH = Path("./files/")
 
 def load_raw(subject, runs):
     subject_dir = DATA_BASE_PATH / f"S{subject:03d}"
@@ -93,18 +96,24 @@ def train_mode(args):
     X = epochs.get_data()
     y = epochs.events[:, 2]
 
-    # Train CV
-    pipeline = build_pipeline()
-    cv = ShuffleSplit(n_splits=10, test_size=0.1, random_state=42)
-    scores = cross_val_score(pipeline, X, y, cv=cv, scoring='accuracy')
+    # Split train/test BEFORE any training
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
 
+    # Train CV on TRAINING SET ONLY
+    pipeline = build_pipeline()
+    cv = ShuffleSplit(n_splits=10, test_size=0.2, random_state=42)
+    scores = cross_val_score(pipeline, X_train, y_train, cv=cv, scoring='accuracy')
+
+    print("Cross-validation scores (on training set):")
     print(scores)
     print(f"Cross-val mean: {np.mean(scores):.4f}")
 
-    # Fit full
-    pipeline.fit(X, y)
+    # Fit on TRAINING SET ONLY
+    pipeline.fit(X_train, y_train)
 
-    # Save
+    # Save model + test indices
     fname = f"model_s{args.subject}_r{args.run}.pkl"
     with open(fname, 'wb') as f:
         pickle.dump({
@@ -113,7 +122,9 @@ def train_mode(args):
             'run': args.run,
             'event_dict': event_dict,
             'cv_scores': scores,
-            'mean_cv_score': np.mean(scores)
+            'mean_cv_score': np.mean(scores),
+            'X_test': X_test,
+            'y_test': y_test
         }, f)
 
     print(f"✔ Model saved to {fname}")
@@ -129,36 +140,32 @@ def predict_mode(args):
         data = pickle.load(f)
 
     pipeline = data['pipeline']
-    event_id = data['event_dict']
+    X_test = data['X_test']
+    y_test = data['y_test']
 
-    # Reload + preprocess
-    raw = preprocess_raw(load_raw(args.subject, [args.run]))
-
-    # Epoch
-    epochs = epoch_data(raw, event_id)
-    X = epochs.get_data()
-    y_true = epochs.events[:, 2]
-
-    # Predict
-    y_pred = pipeline.predict(X)
+    # Predict on the SAME test set that was held out during training
+    y_pred = pipeline.predict(X_test)
 
     # Report
-    print("\nepoch: pred | true | match")
+    print("epoch: pred | true | match")
     correct = 0
-    for i, (p, t) in enumerate(zip(y_pred, y_true)):
+    for i, (p, t) in enumerate(zip(y_pred, y_test)):
         print(f"{i:02d}: [{p}] [{t}] {p==t}")
         correct += (p == t)
 
-    print(f"\nAccuracy: {correct / len(y_true):.4f}")
+    accuracy = correct / len(y_test)
+    print(f"\nAccuracy: {accuracy:.4f}")
     
 def full_evaluation_mode(args):
     subjects = np.arange(1, args.subject + 1)
     all_scores = []
 
     for exp_index, exp_cfg in EXPERIMENTS.items():
-
+        experiment_scores = []
+        print("\n\nExperiment {}: {}".format(exp_index + 1, exp_cfg['desc']))
+        
         for subject in subjects:
-            print(f"\n→ Subject {subject}")
+            print(f"Experiment {exp_index + 1} | Subject {subject}... ", end='', flush=True)
 
             # Load
             try:
@@ -194,22 +201,16 @@ def full_evaluation_mode(args):
             # Build pipeline
             pipeline = build_pipeline()
 
-            param_grid = {
-                'pca__n_components': [2,4,6,8,10,15,20],
-                'lda__shrinkage': ['auto', 0.1, 0.3]
-            }
+            pipeline.fit(X_train, y_train)
 
-            cv = ShuffleSplit(n_splits=10, test_size=0.2, random_state=42)
-            grid = GridSearchCV(pipeline, param_grid, cv=cv,
-                                scoring='accuracy', n_jobs=-1, verbose=0)
-
-            grid.fit(X_train, y_train)
-
-            preds = [grid.predict(X_test[i:i+1])[0] for i in range(len(X_test))]
+            preds = [pipeline.predict(X_test[i:i+1])[0] for i in range(len(X_test))]
             acc = np.mean(preds == y_test)
-            print(f"✔ Accuracy: {acc*100:.2f}%")
-            all_scores.append(acc)
-            
+            print(f"✔ {acc*100:.2f}%")
+            experiment_scores.append(acc)
+
+        print(f"Experiment {exp_index} Accuracy: {np.mean(experiment_scores)*100:.2f}%")
+        all_scores.append(np.mean(experiment_scores)*100)
+
     return all_scores
 
 def visualize_mode(args):
@@ -239,6 +240,7 @@ def visualize_mode(args):
     plt.tight_layout()
     plt.show()
 
+start_time = time.time()
 parser = argparse.ArgumentParser(description='EEG Motor Imagery Classification Pipeline')
 parser.add_argument('subject', type=int, nargs='?', default=109)
 parser.add_argument('run', type=int, nargs='?', default=None)
@@ -253,10 +255,12 @@ elif args.mode == 'predict':
 elif args.mode == 'visualize':
     visualize_mode(args)
 else:
-    all_scores = full_evaluation_mode(args)
+    all_experiment_scores = full_evaluation_mode(args)
 
     print("\n" + "="*60)
     print("FINAL SUMMARY")
     print("="*60)
-    print(f"Mean: {np.mean(all_scores)*100:.2f}%")
-    print(f"Std: {np.std(all_scores)*100:.2f}%")
+    print(f"All Experiment Accuracies: {[f'{score:.2f}%' for score in all_experiment_scores]}")
+    print(f"Mean Accuracy: {np.mean(all_experiment_scores):.2f}%")
+    print(f"Std: {np.std(all_experiment_scores)*100:.2f}%")
+    print(f"Time of Execution: {time.time() - start_time:.2f} seconds")
