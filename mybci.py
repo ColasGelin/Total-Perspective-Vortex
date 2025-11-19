@@ -15,10 +15,23 @@ import time
 
 mne.set_log_level('WARNING')
 warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*annotation.*expanding outside.*')
+warnings.filterwarnings("ignore", message="Channel names are not unique")
 
 MOTOR_CHANNELS = [
     'C3..','Cz..','C4..','Fc3.','Fcz.','Fc4.','Cp3.','Cpz.','Cp4.'
 ]
+
+BCIC_CHANNELS = [
+    'EEG-Fz', 'EEG-0', 'EEG-1', 'EEG-2', 'EEG-3', 'EEG-4', 'EEG-5',
+    'EEG-C3', 'EEG-6', 'EEG-Cz', 'EEG-7', 'EEG-C4', 'EEG-8',
+    'EEG-9', 'EEG-10', 'EEG-11', 'EEG-12', 'EEG-13', 'EEG-Pz',
+    'EEG-14', 'EEG-15', 'EEG-16'
+] 
+
+BCIC_EVENT_MAP = {
+    'left_right': {'769': 'left', '770': 'right'},  # classes 1,2
+    'foot_tongue': {'771': 'foot', '772': 'tongue'}  # classes 3,4
+}
 
 WAVELET_FREQS = np.arange(8, 31, 2)
 
@@ -31,7 +44,85 @@ EXPERIMENTS = {
     5: {'runs': [5, 9, 13], 'events': ['T0', 'T2'], 'desc': 'Rest vs both feet'}
 }
 
+# Add this new constant
+
+
 DATA_BASE_PATH = Path("./files/")
+
+def load_raw_bcic(subject, session='T'):
+    """Load BCI Competition IV 2a dataset (GDF format)."""
+    bcic_path = Path("./bcic_files/")
+    gdf_file = bcic_path / f"A{subject:02d}{session}.gdf"
+    
+    if not gdf_file.exists():
+        raise FileNotFoundError(f"GDF file not found: {gdf_file}")
+    raw = mne.io.read_raw_gdf(gdf_file, preload=True)
+    
+    # Debug: check channels and events
+    events, event_dict = mne.events_from_annotations(raw)
+    return raw
+
+def normalize_bcic(raw):
+    events, ann_dict = mne.events_from_annotations(raw)
+    
+    # Detect whether BCIC labels exist
+    if not any(k in ann_dict for k in ["769", "770", "771", "772"]):
+        print("⚠ normalize_bcic(): No BCIC labels found → skipping BCIC mapping.")
+        return events, {}
+
+    # BCIC labels (string → int)
+    bcic_map = {
+        "769": 1,  # left
+        "770": 2,  # right
+        "771": 3,  # foot
+        "772": 4,  # tongue
+    }
+
+    # Apply mapping to events array
+    new_events = events.copy()
+    for old, new in bcic_map.items():
+        if old in ann_dict:
+            old_code = ann_dict[old]
+            new_events[new_events[:, 2] == old_code, 2] = new
+
+    # Build PhysioNet-like event_id dict
+    event_id = {
+        "left":   1,
+        "right":  2,
+        "foot":   3,
+        "tongue": 4,
+    }
+
+    return new_events, event_id
+
+
+def test_bcic_load(subject=1):
+    """Quick test to verify BCIC data loads correctly."""
+    print("="*60)
+    print(f"TESTING BCIC DATASET - Subject A{subject:02d}")
+    print("="*60)
+    
+    raw = load_raw_bcic(subject, 'T')
+    raw = preprocess_raw(raw, BCIC_CHANNELS)
+    
+    # Get events
+    events, event_dict = mne.events_from_annotations(raw)
+    event_id = {
+        'left': event_dict['769'],
+        'right': event_dict['770'],
+        'foot': event_dict['771'],
+        'tongue': event_dict['772']
+    }
+
+
+    
+    print(f"\n✓ Event mapping: {event_id}")
+    
+    epochs = epoch_data(raw, event_id, tmin=2.0, tmax=6.0)  # BCIC uses 2-6s window
+    print(f"✓ Created {len(epochs)} epochs")
+    print(f"✓ Epoch shape: {epochs.get_data().shape}")
+    
+    return epochs
 
 def load_raw(subject, runs):
     subject_dir = DATA_BASE_PATH / f"S{subject:03d}"
@@ -52,18 +143,25 @@ def load_raw(subject, runs):
     return mne.concatenate_raws(raw_list)
 
 
-def preprocess_raw(raw):
-    """Common preprocessing pipeline for all modes."""
-    raw.pick(MOTOR_CHANNELS)
+def preprocess_raw(raw, channels=None):
+    if channels is not None:
+        raw.pick([ch for ch in channels if ch in raw.ch_names])
+    else:
+        raw.pick(MOTOR_CHANNELS)
+    
     raw.set_eeg_reference('average', projection=True)
     raw.filter(l_freq=8.0, h_freq=30.0, method='fir')
     raw.notch_filter(freqs=60)
     return raw
 
 
-def epoch_data(raw, event_id, tmin=0.0, tmax=3.0):
+
+def epoch_data(raw, event_id, tmin=0.0, tmax=3.0, events=None):
     """Create epochs from raw data."""
-    events, raw_event_dict = mne.events_from_annotations(raw)
+    
+    if len(event_id) != 2:
+        raise ValueError(f"❌ Cannot train: expected 2 classes, found {event_id}")
+
     epochs = mne.Epochs(
         raw, events, event_id=event_id,
         tmin=tmin, tmax=tmax,
@@ -88,11 +186,24 @@ def train_mode(args):
         exit(1)
 
     # Load + preprocess
-    raw = preprocess_raw(load_raw(args.subject, [args.run]))
 
-    # Epoch
-    _, event_dict = mne.events_from_annotations(raw)
-    epochs = epoch_data(raw, event_dict)
+    if args.b:
+        raw = preprocess_raw(load_raw_bcic(args.subject, 'T'), BCIC_CHANNELS)
+        events, event_id = normalize_bcic(raw)
+        # Keep only left vs right
+        mask = np.isin(events[:, 2], [event_id["left"], event_id["right"]])
+        events = events[mask]
+        event_id = {"left": event_id["left"], "right": event_id["right"]}
+    else:
+        raw = preprocess_raw(load_raw(args.subject, [args.run]))
+        events, event_id = mne.events_from_annotations(raw)
+        # Keep only T1 vs T2 (like experiment 0: left vs right fist)
+        mask = np.isin(events[:, 2], [event_id["T1"], event_id["T2"]])
+        events = events[mask]
+        event_id = {"T1": event_id["T1"], "T2": event_id["T2"]}
+        
+    
+    epochs = epoch_data(raw, event_id, events=events)
     X = epochs.get_data()
     y = epochs.events[:, 2]
 
@@ -103,6 +214,8 @@ def train_mode(args):
 
     # Train CV on TRAINING SET ONLY
     pipeline = build_pipeline()
+    print(f"✅ Loaded subject {args.subject}, run {args.run}")
+    
     cv = ShuffleSplit(n_splits=10, test_size=0.2, random_state=42)
     scores = cross_val_score(pipeline, X_train, y_train, cv=cv, scoring='accuracy')
 
@@ -120,7 +233,7 @@ def train_mode(args):
             'pipeline': pipeline,
             'subject': args.subject,
             'run': args.run,
-            'event_dict': event_dict,
+            'event_id': event_id,
             'cv_scores': scores,
             'mean_cv_score': np.mean(scores),
             'X_test': X_test,
@@ -168,69 +281,98 @@ def predict_mode(args):
     
 def full_evaluation_mode(args):
     subjects = np.arange(1, args.subject + 1)
+    if (args.b):
+        subjects = np.arange(1, 10) 
     all_scores = []
+    
+    if args.b:
+        experiments = [
+            {"name": "Left vs Right", "classes": ["left", "right"]},
+            {"name": "Tongue vs Foot", "classes": ["tongue", "foot"]}
+        ]
+    else:
+        experiments = [{"name": exp_cfg["desc"], "runs": exp_cfg["runs"], "events": exp_cfg["events"]}
+                       for exp_cfg in EXPERIMENTS.values()]
 
-    for exp_index, exp_cfg in EXPERIMENTS.items():
+    for exp_index, exp_cfg in enumerate(experiments):
         experiment_scores = []
-        print("\n\nExperiment {}: {}".format(exp_index + 1, exp_cfg['desc']))
-        
+        print(f"\n\nExperiment {exp_index + 1}: {exp_cfg['name']}")
+
         for subject in subjects:
-            print(f"Experiment {exp_index + 1} | Subject {subject}... ", end='', flush=True)
+            print(f"Subject {subject}... ", end='', flush=True)
 
-            # Load
             try:
-                raw = load_raw(subject, exp_cfg['runs'])
-            except:
-                print("Skipping (load error)")
+                if args.b:
+                    # Load BCIC raw data
+                    raw = preprocess_raw(load_raw_bcic(subject, 'T'), BCIC_CHANNELS)
+                    events, event_id = normalize_bcic(raw)
+
+                    # Keep only relevant classes
+                    selected_labels = [event_id[c] for c in exp_cfg["classes"]]
+                    mask = np.isin(events[:, 2], selected_labels)
+                    events = events[mask]
+
+                    filtered_event_id = {c: event_id[c] for c in exp_cfg["classes"]}
+
+                else:
+                    # Motor dataset
+                    raw = preprocess_raw(load_raw(subject, exp_cfg['runs']))
+                    events, event_dict = mne.events_from_annotations(raw)
+                    # Keep only specified events
+                    selected_labels = [event_dict[e] for e in exp_cfg["events"] if e in event_dict]
+                    mask = np.isin(events[:, 2], selected_labels)
+                    events = events[mask]
+
+                    filtered_event_id = {e: event_dict[e] for e in exp_cfg["events"] if e in event_dict}
+
+                if len(filtered_event_id) != 2 or len(events) < 10:
+                    print("Skipping (insufficient data)")
+                    continue
+
+                # Epoch data
+                epochs = epoch_data(raw, filtered_event_id, events=events)
+
+                X = epochs.get_data()
+                y = epochs.events[:, 2]
+
+                # Train/test split
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y, test_size=0.2, random_state=42, stratify=y
+                )
+
+                # Build pipeline
+                pipeline = build_pipeline()
+                pipeline.fit(X_train, y_train)
+
+                # Predict and compute accuracy
+                preds = [pipeline.predict(X_test[i:i+1])[0] for i in range(len(X_test))]
+                acc = np.mean(preds == y_test)
+                print(f"✔ {acc*100:.2f}%")
+                experiment_scores.append(acc)
+
+            except Exception as e:
+                print(f"Skipping (error: {e})")
                 continue
 
-            raw = preprocess_raw(raw)
-
-            # Epoch
-            events, event_dict = mne.events_from_annotations(raw)
-            event_id = {e: event_dict[e] for e in exp_cfg['events'] if e in event_dict}
-            if len(event_id) != 2:
-                print("Skipping (missing events)")
-                continue
-
-            epochs = epoch_data(raw, event_id)
-            epochs = epochs[exp_cfg['events']]
-
-            if len(epochs) < 10:
-                print("Skipping (too few epochs)")
-                continue
-
-            X = epochs.get_data()
-            y = epochs.events[:, 2]
-
-            # Train/test split
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=0.2, random_state=42, stratify=y
-            )
-
-            # Build pipeline
-            pipeline = build_pipeline()
-
-            pipeline.fit(X_train, y_train)
-
-            preds = [pipeline.predict(X_test[i:i+1])[0] for i in range(len(X_test))]
-            acc = np.mean(preds == y_test)
-            print(f"✔ {acc*100:.2f}%")
-            experiment_scores.append(acc)
-
-        print(f"Experiment {exp_index} Accuracy: {np.mean(experiment_scores)*100:.2f}%")
-        all_scores.append(np.mean(experiment_scores)*100)
+        mean_exp_score = np.mean(experiment_scores) if experiment_scores else 0.0
+        print(f"Experiment {exp_index + 1} Accuracy: {mean_exp_score*100:.2f}%")
+        all_scores.append(mean_exp_score*100)
 
     return all_scores
 
 def visualize_mode(args):
-    # Load and filter
-    raw_original = load_raw(args.subject, [args.run])
-    raw_original.pick(MOTOR_CHANNELS)
-    raw_filtered = preprocess_raw(load_raw(args.subject, [args.run]))
+    
+    if args.b:
+        raw_original = load_raw_bcic(args.subject, 'T')
+        raw_original.pick(BCIC_CHANNELS)
+        raw_filtered = preprocess_raw(raw_original, BCIC_CHANNELS)
+    else:
+        raw_original = load_raw(args.subject, [args.run])
+        raw_original.pick(MOTOR_CHANNELS)
+        raw_filtered = preprocess_raw(raw_original)
     
     # Figure 1: Filtered EEG
-    raw_filtered.plot(duration=10, n_channels=len(MOTOR_CHANNELS),
+    raw_filtered.plot(duration=10, n_channels=len(raw_filtered.ch_names),
                       scalings='auto', title='Filtered EEG Data (8-30 Hz)')
     
     # Figure 2: PSD comparison
@@ -256,7 +398,7 @@ parser.add_argument('subject', type=int, nargs='?', default=109)
 parser.add_argument('run', type=int, nargs='?', default=None)
 parser.add_argument('mode', type=str, nargs='?', default='eval',
                     choices=['train', 'predict', 'eval', 'visualize'])
-parser.add_argument('-b', action='store_true', dest='b_flag', 
+parser.add_argument('--bcic', '-b', action='store_true', dest='b', default=False, 
                     help='Set b_flag variable to True')
 args = parser.parse_args()
 
