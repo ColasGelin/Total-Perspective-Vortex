@@ -67,6 +67,10 @@ class PCA(BaseEstimator, TransformerMixin):
             n_keep = int(self.n_components)
 
         self.n_selected_ = n_keep
+        
+        
         self.components_ = self.eig_vecs[:, :n_keep]
+        
+        
         self.explained_variance_ = self.eig_vals[:n_keep]
         self.explained_variance_ratio_ = self.explained_variance_ratio_[:n_keep]

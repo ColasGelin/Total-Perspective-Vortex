@@ -2,7 +2,6 @@ from pathlib import Path
 import mne
 import numpy as np
 from sklearn.pipeline import Pipeline
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.model_selection import cross_val_score, train_test_split, GridSearchCV, ShuffleSplit
 from sklearn.preprocessing import StandardScaler
 import argparse
@@ -12,6 +11,7 @@ from wavelet_transformer import WaveletTransformer
 import matplotlib.pyplot as plt
 import warnings
 import time
+from lda import LDA
 
 mne.set_log_level('WARNING')
 warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*annotation.*expanding outside.*')
@@ -177,7 +177,7 @@ def build_pipeline():
         ('wavelet', WaveletTransformer(frequencies=WAVELET_FREQS)),
         ('scaler', StandardScaler()),
         ('pca', PCA()),
-        ('lda', LinearDiscriminantAnalysis(solver="lsqr"))
+        ('lda', LDA(shrinkage=1e-4))
     ])
 
 def train_mode(args):
@@ -209,18 +209,20 @@ def train_mode(args):
 
     # Split train/test BEFORE any training
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.3, random_state=42, stratify=y
+        X, y, test_size=0.25, random_state=42, stratify=y
     )
 
     # Train CV on TRAINING SET ONLY
     pipeline = build_pipeline()
-    print(f"✅ Loaded subject {args.subject}, run {args.run}")
+    print(f"Loaded subject {args.subject}, run {args.run}")
     
     cv = ShuffleSplit(n_splits=10, test_size=0.2, random_state=42)
+    # print number of training samples
+    print(f"Training samples: {len(X_train)}, Test samples: {len(X_test)}")
     scores = cross_val_score(pipeline, X_train, y_train, cv=cv, scoring='accuracy')
 
     print("Cross-validation scores (on training set):")
-    print(scores)
+    print([f"{score:.4f}" for score in scores])
     print(f"Cross-val mean: {np.mean(scores):.4f}")
 
     # Fit on TRAINING SET ONLY
@@ -337,7 +339,7 @@ def full_evaluation_mode(args):
 
                 # Train/test split
                 X_train, X_test, y_train, y_test = train_test_split(
-                    X, y, test_size=0.2, random_state=42, stratify=y
+                    X, y, test_size=0.25, random_state=42, stratify=y
                 )
 
                 # Build pipeline
@@ -416,5 +418,4 @@ else:
     print("="*60)
     print(f"All Experiment Accuracies: {[f'{score:.2f}%' for score in all_experiment_scores]}")
     print(f"Mean Accuracy: {np.mean(all_experiment_scores):.2f}%")
-    print(f"Std: {np.std(all_experiment_scores)*100:.2f}%")
     print(f"Time of Execution: {time.time() - start_time:.2f} seconds")
